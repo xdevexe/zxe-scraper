@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "functions": {
+    "api/stream.js": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/stream",
+      "dest": "/api/stream.js"
+    }
+  ]
+}
