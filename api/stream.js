@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
         let streamQuery = imdbId;
         if (type === 'tv') streamQuery += `:${season}:${episode}`;
 
-        // 2. Recherche du torrent
+        // 2. Recherche des torrents via Torrentio
         const torrentioUrl = `https://torrentio.strem.fun/providers=yts,eztv,rarbg,1337x,torrent9,cpasbien|qualityfilter=scr,cam/stream/${type}/${streamQuery}.json`;
         const torrentioRes = await fetch(torrentioUrl);
         const torrentioData = await torrentioRes.json();
@@ -31,75 +31,82 @@ module.exports = async (req, res) => {
             return res.status(404).json({ error: "Aucun torrent trouvé pour ce contenu." });
         }
 
-        // Priorité VF / FRENCH
-        let bestStream = torrentioData.streams.find(s => 
+        // 3. Filtrer et trier pour mettre toutes les versions françaises (VF, FRENCH, VFF, MULTI) en haut de la liste
+        const frenchStreams = torrentioData.streams.filter(s => 
             s.title.toLowerCase().includes('french') || 
             s.title.toLowerCase().includes(' vf') || 
-            s.title.toLowerCase().includes('vff')
+            s.title.toLowerCase().includes('vff') ||
+            s.title.toLowerCase().includes('multi')
         );
 
-        if (!bestStream) bestStream = torrentioData.streams[0];
-        const infoHash = bestStream.infoHash;
+        // Si aucun flux n'est étiqueté français, on garde toute la liste (internationale/multi) pour ne pas bloquer le film
+        const streamsToTest = frenchStreams.length > 0 ? frenchStreams : torrentioData.streams;
 
-        // 3. Ajout du Magnet sur Real-Debrid
-        const addMagnetRes = await fetch('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${rdToken}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `magnet=magnet:?xt=urn:btih:${infoHash}`
-        });
-        const magnetData = await addMagnetRes.json();
+        let finalDownloadUrl = null;
 
-        // 4. Sélection des fichiers
-        await fetch(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${magnetData.id}`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${rdToken}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: 'files=all'
-        });
+        // 4. Boucle magique : on teste les torrents un par un jusqu'à en trouver un déjà en cache
+        for (const stream of streamsToTest) {
+            const infoHash = stream.infoHash;
 
-        // 5. Attendre un court instant que l'API génère les liens ou vérifie le statut
-        let torrentInfo;
-        let attempts = 0;
-        while (attempts < 5) {
-            const torrentInfoRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${magnetData.id}`, {
+            // On demande à Real-Debrid si ce hash précis est instantané (cached)
+            const checkCacheRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${infoHash}`, {
                 headers: { 'Authorization': `Bearer ${rdToken}` }
             });
-            torrentInfo = await torrentInfoRes.json();
-            
-            // Si le torrent est déjà disponible et qu'on a des liens, on sort de la boucle
-            if (torrentInfo.links && torrentInfo.links.length > 0) {
-                break;
+            const cacheData = await checkCacheRes.json();
+
+            // Structure de réponse RD : si le hash contient des données de fichiers, il est instantané !
+            if (cacheData[infoHash] && cacheData[infoHash].rd && cacheData[infoHash].rd.length > 0) {
+                
+                // Le torrent est en cache ! On l'ajoute immédiatement
+                const addMagnetRes = await fetch('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${rdToken}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: `magnet=magnet:?xt=urn:btih:${infoHash}`
+                });
+                const magnetData = await addMagnetRes.json();
+
+                // Sélection des fichiers immédiate
+                await fetch(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${magnetData.id}`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${rdToken}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'files=all'
+                });
+
+                // Récupération instantanée des infos
+                const torrentInfoRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${magnetData.id}`, {
+                    headers: { 'Authorization': `Bearer ${rdToken}` }
+                });
+                const torrentInfo = await torrentInfoRes.json();
+
+                if (torrentInfo.links && torrentInfo.links.length > 0) {
+                    const premiumLink = torrentInfo.links[0]; 
+
+                    // Débridage ultra-rapide
+                    const unrestrictRes = await fetch('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${rdToken}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: `link=${premiumLink}`
+                    });
+                    const finalData = await unrestrictRes.json();
+
+                    if (finalData.download) {
+                        finalDownloadUrl = finalData.download;
+                        break; // On a notre vidéo instantanée, on arrête de chercher !
+                    }
+                }
             }
-            
-            // Attendre 1,5 seconde avant de réessayer
-            await new Promise(resolve => setTimeout(resolve, 1500));
-            attempts++;
         }
 
-        // Sécurité si le torrent n'est pas encore téléchargé sur RD
-        if (!torrentInfo.links || torrentInfo.links.length === 0) {
-            return res.status(202).json({ 
-                error: "Le film est en cours de mise en cache sur Real-Debrid.", 
-                progress: `${torrentInfo.progress || 0}%`,
-                details: "Ce torrent n'était pas encore stocké. Relance la vidéo dans une minute, le temps que Real-Debrid finisse de le télécharger." 
+        // 5. Si après avoir tout fouillé, aucun flux français n'est en cache, on renvoie une erreur propre
+        if (!finalDownloadUrl) {
+            return res.status(404).json({ 
+                error: "Aucune version instantanée trouvée.", 
+                details: "Toutes les versions françaises nécessitent un téléchargement complet. Utilise une source de secours gratuite (Smashy, AutoEmbed) pour ce film spécifique." 
             });
         }
 
-        const premiumLink = torrentInfo.links[0]; 
-
-        // 6. Débrider le lien final
-        const unrestrictRes = await fetch('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${rdToken}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `link=${premiumLink}`
-        });
-        const finalData = await unrestrictRes.json();
-
-        if (!finalData.download) {
-            return res.status(500).json({ error: "Échec du débridage du lien premium." });
-        }
-
-        // Redirection vers le flux vidéo propre
-        res.redirect(finalData.download);
+        // Redirection directe vers le film (ZÉRO ATTENTE !)
+        res.redirect(finalDownloadUrl);
 
     } catch (error) {
         res.status(500).json({ error: "Erreur interne du scraper", details: error.message });
